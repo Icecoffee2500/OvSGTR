@@ -414,7 +414,7 @@ class GroundingDINO(nn.Module):
         text_dict = self.encode_captions(captions, samples.device, encode_relation=False)
 
         if self.do_sgg and len(rel_captions) == 0 and self.sgg_mode != 'full':
-            raise Exception("rel_caption cannot be None !")
+            raise Exception("rel_captions cannot be None !")
 
         rel_text_dict = None 
         if self.do_sgg and self.sgg_mode != 'full':
