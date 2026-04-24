@@ -27,6 +27,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     logger=None, ema_m=None, wandb_logger=None, 
                     model_t=None):
 
+    # ----------------------------------------------------
+    # ------------- setting before training --------------
+    # ----------------------------------------------------
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     teacher_update_interval = getattr(args, "teacher_update_interval", 1000)
@@ -61,6 +64,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     _cnt = 0
 
+    # ----------------------------------------------------
+    # ------------------- training -----------------------
+    # ----------------------------------------------------
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header, logger=logger):
         args.global_iter += 1
 
@@ -87,7 +93,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
             weight_dict = criterion.weight_dict
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-
+        # -------------------------------------------------------------------------------------------- forward pass and compute loss
                
 
         # reduce losses over all GPUs for logging purposes
@@ -106,6 +112,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             sys.exit(1)
 
 
+        # ----------------------------------------------------
+        # ------------- backward pass and update weights -----
+        # ----------------------------------------------------
         # amp backward function
         if args.amp:
             optimizer.zero_grad()
@@ -123,6 +132,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
 
+        # ----------------------------------------------------
+        # ------------- update teacher's weights -------------
+        # ----------------------------------------------------
         if model_t is not None and teacher_update and args.global_iter % teacher_update_interval == 0:
             if utils.get_rank() == 0:
                 print("*"*10, "global iter:", args.global_iter, 
@@ -143,6 +155,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             if epoch >= args.ema_epoch:
                 ema_m.update(model)
 
+        # ----------------------------------------------------
+        # ------------- logging -----------------------------
+        # ----------------------------------------------------
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         if 'class_error' in loss_dict_reduced:
             metric_logger.update(class_error=loss_dict_reduced['class_error'])
@@ -180,7 +195,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, wo_class_error=False, args=None, logger=None):
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, wo_class_error=False, args=None, logger=None, wandb_logger=None):
     try:
         need_tgt_for_training = args.use_dn
     except:
@@ -258,6 +273,50 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             data_loader.dataset.ann_folder,
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
+
+    # ==================== TDA: 평가 시작 전 캐시 초기화 ====================
+    pp = postprocessors['bbox']
+    tda_collect_stats = getattr(args, "tda_collect_stats", False)
+    pp.tda_collect_stats = tda_collect_stats
+
+    # TDA: Object Classification
+    tda_obj_enabled = getattr(args, "tda_obj_enabled", False)
+    if tda_obj_enabled:
+        pp.tda_obj_enabled = True
+        pp.tda_obj_pos_cache = {}
+        pp.tda_obj_neg_cache = {}
+        pp.tda_obj_pos_alpha = getattr(args, "tda_obj_pos_alpha", 1.0)
+        pp.tda_obj_pos_beta = getattr(args, "tda_obj_pos_beta", 5.0)
+        pp.tda_obj_pos_shot_capacity = getattr(args, "tda_obj_pos_shot_capacity", 5)
+        pp.tda_obj_neg_alpha = getattr(args, "tda_obj_neg_alpha", 0.1)
+        pp.tda_obj_neg_beta = getattr(args, "tda_obj_neg_beta", 1.0)
+        pp.tda_obj_neg_shot_capacity = getattr(args, "tda_obj_neg_shot_capacity", 3)
+        pp.tda_obj_neg_entropy_lower = getattr(args, "tda_obj_neg_entropy_lower", 0.2)
+        pp.tda_obj_neg_entropy_upper = getattr(args, "tda_obj_neg_entropy_upper", 0.5)
+        pp.tda_obj_neg_mask_lower = getattr(args, "tda_obj_neg_mask_lower", 0.03)
+        pp.tda_obj_neg_mask_upper = getattr(args, "tda_obj_neg_mask_upper", 1.0)
+        pp.tda_obj_score_threshold = getattr(args, "tda_obj_score_threshold", 0.3)
+        print("[TDA] Enabled for object classification")
+
+    # TDA: Relation Classification
+    tda_rln_enabled = getattr(args, "tda_rln_enabled", False)
+    if tda_rln_enabled:
+        pp.tda_rln_enabled = True
+        pp.tda_rln_pos_cache = {}
+        pp.tda_rln_neg_cache = {}
+        pp.tda_rln_pos_alpha = getattr(args, "tda_rln_pos_alpha", 1.0)
+        pp.tda_rln_pos_beta = getattr(args, "tda_rln_pos_beta", 5.0)
+        pp.tda_rln_pos_shot_capacity = getattr(args, "tda_rln_pos_shot_capacity", 5)
+        pp.tda_rln_neg_alpha = getattr(args, "tda_rln_neg_alpha", 0.1)
+        pp.tda_rln_neg_beta = getattr(args, "tda_rln_neg_beta", 1.0)
+        pp.tda_rln_neg_shot_capacity = getattr(args, "tda_rln_neg_shot_capacity", 3)
+        pp.tda_rln_neg_entropy_lower = getattr(args, "tda_rln_neg_entropy_lower", 0.2)
+        pp.tda_rln_neg_entropy_upper = getattr(args, "tda_rln_neg_entropy_upper", 0.5)
+        pp.tda_rln_neg_mask_lower = getattr(args, "tda_rln_neg_mask_lower", 0.03)
+        pp.tda_rln_neg_mask_upper = getattr(args, "tda_rln_neg_mask_upper", 1.0)
+        pp.tda_rln_score_threshold = getattr(args, "tda_rln_score_threshold", 0.3)
+        print("[TDA] Enabled for relation classification")
+    # ==================== TDA End ====================
 
     _cnt = 0
     output_state_dict = {} # for debug only
@@ -436,7 +495,76 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         if sgg_res is not None:
             stats.update(sgg_res)
 
+    # ==================== TDA: Stats 수집 결과 처리 및 wandb 로깅 ====================
+    if tda_collect_stats and (tda_obj_enabled or tda_rln_enabled):
+        tda_stats = pp.get_tda_stats()
 
+        for domain, domain_label in [('obj', 'Object'), ('rln', 'Relation')]:
+            ds = tda_stats[domain]
+            for key in ['entropies', 'scores', 'affinities_pos', 'affinities_neg']:
+                summary = ds[key]
+                if summary is None:
+                    print(f"[TDA Stats] {domain_label}/{key}: empty")
+                    continue
+                pcts = summary['percentiles']
+                print(f"[TDA Stats] {domain_label}/{key}: "
+                      f"n={summary['n']}, mean={summary['mean']:.4f}, std={summary['std']:.4f}, "
+                      f"min={summary['min']:.4f}, max={summary['max']:.4f}")
+                print(f"  percentiles: 5%={pcts[5]:.4f}, 10%={pcts[10]:.4f}, "
+                      f"25%={pcts[25]:.4f}, 50%={pcts[50]:.4f}, "
+                      f"75%={pcts[75]:.4f}, 90%={pcts[90]:.4f}, 95%={pcts[95]:.4f}")
+
+                if wandb_logger is not None:
+                    try:
+                        import wandb
+                        import numpy as np
+                        h_min = summary['hist_min']
+                        h_max = summary['hist_max']
+                        num_bins = len(summary['hist_counts'])
+                        bin_edges = np.linspace(h_min, h_max, num_bins + 1)
+                        wandb_hist = wandb.Histogram(
+                            np_histogram=(np.array(summary['hist_counts']), bin_edges))
+                        wandb_logger.log({
+                            f"tda_stats/{domain}/{key}_hist": wandb_hist,
+                            f"tda_stats/{domain}/{key}_n": summary['n'],
+                            f"tda_stats/{domain}/{key}_mean": summary['mean'],
+                            f"tda_stats/{domain}/{key}_std": summary['std'],
+                            f"tda_stats/{domain}/{key}_p10": pcts[10],
+                            f"tda_stats/{domain}/{key}_p25": pcts[25],
+                            f"tda_stats/{domain}/{key}_p50": pcts[50],
+                            f"tda_stats/{domain}/{key}_p75": pcts[75],
+                            f"tda_stats/{domain}/{key}_p90": pcts[90],
+                        })
+                    except Exception as e:
+                        print(f"[TDA Stats] wandb logging failed for {domain}/{key}: {e}")
+
+        # 캐시 크기 정보
+        if tda_obj_enabled:
+            n_pos = sum(len(v) for v in pp.tda_obj_pos_cache.values())
+            n_neg = sum(len(v) for v in pp.tda_obj_neg_cache.values())
+            n_pos_cls = len(pp.tda_obj_pos_cache)
+            n_neg_cls = len(pp.tda_obj_neg_cache)
+            print(f"[TDA Stats] Object pos_cache: {n_pos} entries across {n_pos_cls} classes")
+            print(f"[TDA Stats] Object neg_cache: {n_neg} entries across {n_neg_cls} classes")
+        if tda_rln_enabled:
+            n_pos = sum(len(v) for v in pp.tda_rln_pos_cache.values())
+            n_neg = sum(len(v) for v in pp.tda_rln_neg_cache.values())
+            n_pos_cls = len(pp.tda_rln_pos_cache)
+            n_neg_cls = len(pp.tda_rln_neg_cache)
+            print(f"[TDA Stats] Relation pos_cache: {n_pos} entries across {n_pos_cls} classes")
+            print(f"[TDA Stats] Relation neg_cache: {n_neg} entries across {n_neg_cls} classes")
+
+    # wandb에 최종 메트릭 로깅
+    if wandb_logger is not None:
+        wandb_metrics = {}
+        for k, v in stats.items():
+            if isinstance(v, (int, float)):
+                wandb_metrics[f"eval/{k}"] = v
+            elif isinstance(v, list) and k == 'coco_eval_bbox':
+                wandb_metrics["eval/mAP"] = v[0]
+                wandb_metrics["eval/mAP50"] = v[1]
+        wandb_logger.log(wandb_metrics)
+    # ==================== TDA Stats End ====================
 
     return stats, coco_evaluator
 

@@ -10,3 +10,5 @@ build
 *.pth
 *.egg
 dist
+wandb/
+data/

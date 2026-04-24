@@ -92,6 +92,12 @@ def get_args_parser():
     parser.add_argument("--local_rank", type=int, help='local rank for DistributedDataParallel')
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
+
+    # wandb parameters for eval
+    parser.add_argument('--wandb_project', type=str, default=None,
+                        help='wandb project name (enables wandb logging during eval)')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='wandb run name for this experiment')
     
     return parser
 
@@ -106,6 +112,9 @@ def build_model_main(args):
     return model, criterion, postprocessors
 
 def main(gpu, ngpus_per_node, args):
+    # ----------------------------------------------------
+    # ------------ multi gpu 학습 설정 ---------------------
+    # ----------------------------------------------------
     args.gpu = gpu 
     #utils.init_distributed_mode(args)
     if args.distributed:
@@ -120,6 +129,9 @@ def main(gpu, ngpus_per_node, args):
 
     torch.cuda.set_device(args.gpu)
 
+    # ----------------------------------------------------
+    # -------- seed 설정 (for reproducibility) ------------
+    # ----------------------------------------------------
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
@@ -127,6 +139,9 @@ def main(gpu, ngpus_per_node, args):
     random.seed(seed)
     #torch.set_deterministic(True)
 
+    # ----------------------------------------------------
+    # ------------ config file 로드 ---------------------
+    # ----------------------------------------------------
     # load cfg file and update the args
     if args.rank == 0:
         print("Loading config file from {}".format(args.config_file))
@@ -157,6 +172,9 @@ def main(gpu, ngpus_per_node, args):
     if not getattr(args, 'debug', None):
         args.debug = False
 
+    # ----------------------------------------------------
+    # --------- logger 설정 (+wandb logger) ---------------
+    # ----------------------------------------------------
     # setup logger
     os.makedirs(args.output_dir, exist_ok=True)
     logger = setup_logger(output=os.path.join(args.output_dir, 'info.txt'), distributed_rank=args.rank, color=False, name="detr")
@@ -173,9 +191,18 @@ def main(gpu, ngpus_per_node, args):
     logger.info("args: " + str(args) + '\n')
 
     wandb_logger = None
-    if utils.get_rank() == 0 and not args.eval:
-        if os.environ.get("DEBUG") not in ['1', '2']:
-            wandb_logger = wandb.init(config=args, project='dino-'+args.dataset_file)
+    if utils.get_rank() == 0:
+        if args.eval and args.wandb_project:
+            tda_config = {k: v for k, v in vars(args).items()
+                          if k.startswith('tda_') or k in ('wandb_run_name', 'dataset_file', 'resume')}
+            wandb_logger = wandb.init(
+                config=tda_config,
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+            )
+        elif not args.eval:
+            if os.environ.get("DEBUG") not in ['1', '2']:
+                wandb_logger = wandb.init(config=args, project='dino-'+args.dataset_file)
 
     if not hasattr(args, "frozen_weights"):
         args.frozen_weights = None
@@ -186,9 +213,13 @@ def main(gpu, ngpus_per_node, args):
 
     device = torch.device(args.device)
 
+    # 분산학습에서 모든 process가 이 시점에 도달할 때까지 대기. (동기화.)
     if args.distributed:
-        dist.barrier()
+        dist.barrier() # ------------------------------------------------------------------------
 
+    # ----------------------------------------------------
+    # ------- model, criterion, postprocessors 설정 -------
+    # ----------------------------------------------------
     # build model
     model, criterion, postprocessors = build_model_main(args)
     model_without_ddp = model
@@ -229,6 +260,9 @@ def main(gpu, ngpus_per_node, args):
     else:
         ema_m = None
 
+    # ----------------------------------------------------
+    # ------------- pre-trained weights 로드 --------------
+    # ----------------------------------------------------
     # load pre-trained weights
     if (not args.resume) and args.pretrain_model_path:
         logger.info("*"*10 + "Loading weights from pretrained model:%s ..." % args.pretrain_model_path)
@@ -278,6 +312,9 @@ def main(gpu, ngpus_per_node, args):
             rln_text_proj.load_state_dict(feat_map_state) # initialize rln_text_proj with feat_map
             logger.info("*"*10 + "Copy weights from feat_map to rln_text_proj" + "*"*10)
 
+    # ----------------------------------------------------
+    # ------ teacher model 설정 (if use_distill=True) -----
+    # ----------------------------------------------------
     if getattr(args, "use_distill", False):
         logger.info("*"*10 + "use_distill=True!")
         model_t = copy.deepcopy(model)
@@ -295,8 +332,11 @@ def main(gpu, ngpus_per_node, args):
         model_t = None 
         rln_proj_teacher = None
 
+    # ----------------------------------------------------
+    # ------------- model DDP 설정 ------------------------
+    # ----------------------------------------------------
     if args.distributed:
-        dist.barrier()
+        dist.barrier() # -------------------------------------------------------------------------------
         if args.find_unused_params:
             print("*"*10, "Warning: find_unused_parameters = True !")
         model = DDP(model, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
@@ -315,10 +355,9 @@ def main(gpu, ngpus_per_node, args):
             rln_freq_bias = DDP(rln_freq_bias, device_ids=[args.gpu],
                                  find_unused_parameters=args.find_unused_params)
 
-
-
-
-
+    # ----------------------------------------------------
+    # ---------- criterion (optimizer) 설정 ---------------
+    # ----------------------------------------------------
     criterion.rln_proj = rln_proj
     criterion.rln_proj_teacher = rln_proj_teacher
     criterion.rln_classifier =  rln_classifier
@@ -345,6 +384,9 @@ def main(gpu, ngpus_per_node, args):
                                   weight_decay=args.weight_decay)
     
 
+    # ----------------------------------------------------
+    # ----------- dataset & dataloader 설정 ---------------
+    # ----------------------------------------------------
     dataset_train = build_dataset(image_set='train', args=args)
     
     use_test_set = getattr(args, "use_test_set", False)
@@ -383,6 +425,9 @@ def main(gpu, ngpus_per_node, args):
                                  pin_memory=True
                                  )
 
+    # ----------------------------------------------------
+    # ----------- lr scheduler 설정 -----------------------
+    # ----------------------------------------------------
     if args.onecyclelr:
         lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(data_loader_train), epochs=args.epochs, pct_start=0.2)
     elif args.multi_step_lr:
@@ -399,6 +444,9 @@ def main(gpu, ngpus_per_node, args):
         base_ds = get_coco_api_from_dataset(dataset_val)
 
 
+    # ----------------------------------------------------
+    # ------------------- resume 설정 ---------------------
+    # ----------------------------------------------------
     output_dir = Path(args.output_dir)
     if os.path.exists(os.path.join(args.output_dir, 'checkpoint.pth')):
         args.resume = os.path.join(args.output_dir, 'checkpoint.pth')
@@ -430,12 +478,17 @@ def main(gpu, ngpus_per_node, args):
             args.start_epoch = checkpoint['epoch'] + 1
 
 
+    # ----------------------------------------------------
+    # ----- eval 설정 (만약 evaluation만 할거면 여기서 끝.) -----
+    # ----------------------------------------------------
     if args.eval:
         if args.distributed:
-            dist.barrier()
+            dist.barrier() # ----------------------------------------------------------------
 
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device, args.output_dir, wo_class_error=wo_class_error, args=args)
+                                              data_loader_val, base_ds, device, args.output_dir,
+                                              wo_class_error=wo_class_error, args=args,
+                                              wandb_logger=wandb_logger)
         if args.output_dir and coco_evaluator is not None:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
 
@@ -450,9 +503,11 @@ def main(gpu, ngpus_per_node, args):
         return
 
 
-
+    # ----------------------------------------------------
+    # -------------- eval before training ----------------
+    # ----------------------------------------------------
     if args.distributed:
-        dist.barrier()
+        dist.barrier() # ------------------------------------------------------------------------
 
     start_time = time.time()
     best_map_holder = BestMetricHolder(use_ema=args.use_ema)
@@ -481,10 +536,14 @@ def main(gpu, ngpus_per_node, args):
             wandb_logger.log({'epoch': -1, 'eval': map_regular})
 
     if args.distributed:
-        dist.barrier()
+        dist.barrier() # -------------------------------------------------------------------------------
     print("*"*10, " start training ...")
     args.global_iter = -1
 
+    
+    # ----------------------------------------------------
+    # ------------------- training -----------------------
+    # ----------------------------------------------------
     # train
     for epoch in range(args.start_epoch, args.epochs):
         epoch_start_time = time.time()
@@ -519,7 +578,11 @@ def main(gpu, ngpus_per_node, args):
                         'ema_model': ema_m.module.state_dict(),
                     })
                 utils.save_on_master(weights, checkpoint_path)
-                
+        # ---------------------------------------------------------------------- train one epoch and save checkpoint        
+        
+        # ----------------------------------------------------
+        # ------------------- evaluation ---------------------
+        # ----------------------------------------------------
         # eval
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
@@ -555,6 +618,9 @@ def main(gpu, ngpus_per_node, args):
             **{f'test_{k}': v for k, v in test_stats.items()},
         }
 
+        # ------------------------------------------------------------------
+        # --- GroundingDINO에서 사용되는 ema 설정 (기본적으로 OvSGTR에서는 사용 x)----
+        # ------------------------------------------------------------------
         # eval ema
         if args.use_ema:
             ema_test_stats, ema_coco_evaluator = evaluate(
@@ -584,6 +650,7 @@ def main(gpu, ngpus_per_node, args):
             log_stats.update({'now_time': str(datetime.datetime.now())})
         except:
             pass
+        # ----------------------------------------------------------------------------
         
         epoch_time = time.time() - epoch_start_time
         epoch_time_str = str(datetime.timedelta(seconds=int(epoch_time)))
@@ -635,5 +702,5 @@ if __name__ == '__main__':
         args.dist_url = 'tcp://127.0.0.1:' + str(port_id)
         mp.spawn(main, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
-        main(args.rank, ngpus_per_node, args)
+        main(args.rank, ngpus_per_node, args) # rank는 multi node 학습 시 사용하는 것.
 

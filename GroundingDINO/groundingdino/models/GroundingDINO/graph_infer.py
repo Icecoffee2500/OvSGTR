@@ -1,9 +1,12 @@
 # modified from https://github.com/suprosanna/relationformer/blob/scene_graph/inference.py
+import math
 import torch
 import numpy as np
 
 from typing import List, Dict
 import copy
+
+from .utils import tda_update_cache, tda_compute_cache_logits
 
 
 def graph_infer(outputs : List[Dict], 
@@ -14,7 +17,25 @@ def graph_infer(outputs : List[Dict],
                 tokenizer,
                 use_sigmoid=False,
                 use_classifier=False,
-                save_features=False):
+                save_features=False,
+                # ==================== TDA: Relation Classification 파라미터 ====================
+                tda_rln_enabled=False,
+                tda_rln_pos_cache=None,
+                tda_rln_neg_cache=None,
+                tda_rln_pos_alpha=1.0,
+                tda_rln_pos_beta=5.0,
+                tda_rln_pos_shot_capacity=5,
+                tda_rln_neg_alpha=0.1,
+                tda_rln_neg_beta=1.0,
+                tda_rln_neg_shot_capacity=3,
+                tda_rln_neg_entropy_lower=0.2,
+                tda_rln_neg_entropy_upper=0.5,
+                tda_rln_neg_mask_lower=0.03,
+                tda_rln_neg_mask_upper=1.0,
+                tda_rln_score_threshold=0.3,
+                tda_rln_stats=None,
+                # ==================== TDA End ====================
+                ):
     dst = []
     if rln_freq_bias is not None:
         use_sigmoid = False 
@@ -70,6 +91,68 @@ def graph_infer(outputs : List[Dict],
                                           pred_classes[node_pairs[:, 1]]), 1))
 
                     relation_logits += bias
+
+                # ==================== TDA: Relation Classification Logit 보정 ====================
+                if tda_rln_enabled and tda_rln_pos_cache is not None:
+                    num_rln_cat = relation_logits.shape[-1]
+                    _collect = tda_rln_stats is not None
+
+                    # TDA: L2 normalize relation features
+                    rln_feat_norm = relation_feat / (relation_feat.norm(dim=-1, keepdim=True) + 1e-8)
+
+                    # TDA Step 1: 기존 캐시로 relation logit 보정
+                    pos_cache_logits = tda_compute_cache_logits(
+                        rln_feat_norm, tda_rln_pos_cache,
+                        tda_rln_pos_alpha, tda_rln_pos_beta, num_rln_cat,
+                        affinity_collector=tda_rln_stats['affinities_pos'] if _collect else None)
+                    neg_cache_logits = tda_compute_cache_logits(
+                        rln_feat_norm, tda_rln_neg_cache,
+                        tda_rln_neg_alpha, tda_rln_neg_beta, num_rln_cat,
+                        neg_mask_thresholds=(tda_rln_neg_mask_lower, tda_rln_neg_mask_upper),
+                        affinity_collector=tda_rln_stats['affinities_neg'] if _collect else None)
+
+                    if pos_cache_logits is not None:
+                        relation_logits = relation_logits + pos_cache_logits
+                    if neg_cache_logits is not None:
+                        relation_logits = relation_logits - neg_cache_logits
+
+                    # TDA Step 2: high-confidence relation을 캐시에 추가
+                    rln_prob_for_cache = relation_logits.softmax(-1)
+                    rln_scores_max, rln_preds = rln_prob_for_cache[:, 1:].max(dim=-1)
+                    rln_preds = rln_preds + 1  # index 0은 background이므로 +1
+
+                    for rid in range(relation_feat.shape[0]):
+                        score = rln_scores_max[rid].item()
+                        pred_class = rln_preds[rid].item()
+
+                        if score < tda_rln_score_threshold:
+                            continue
+
+                        feat = rln_feat_norm[rid].unsqueeze(0)
+                        det_prob = rln_prob_for_cache[rid]
+                        entropy = -(det_prob * torch.log(det_prob + 1e-8)).sum()
+                        max_entropy = math.log(num_rln_cat)
+                        prop_entropy = float(entropy / max_entropy)
+                        loss_val = float(entropy)
+
+                        if _collect:
+                            tda_rln_stats['entropies'].update_single(prop_entropy)
+                            tda_rln_stats['scores'].update_single(score)
+
+                        # TDA: Positive cache 업데이트
+                        tda_update_cache(
+                            tda_rln_pos_cache, pred_class,
+                            feat, loss_val, tda_rln_pos_shot_capacity)
+
+                        # TDA: Negative cache 업데이트 (중간 entropy 영역)
+                        if tda_rln_neg_entropy_lower < prop_entropy < tda_rln_neg_entropy_upper:
+                            prob_map = det_prob.unsqueeze(0)
+                            tda_update_cache(
+                                tda_rln_neg_cache, pred_class,
+                                feat, loss_val, tda_rln_neg_shot_capacity,
+                                prob_map=prob_map)
+                # ==================== TDA: Relation Classification End ====================
+
             else:
                 relation_logits = torch.einsum("a d, b d -> a b", relation_feat, encoded_text)
                 relation_logits.masked_fill(~text_mask, float('-inf'))

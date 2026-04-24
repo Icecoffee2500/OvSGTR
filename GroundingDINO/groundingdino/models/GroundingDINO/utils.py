@@ -409,4 +409,125 @@ class FullProbObjectnessHead(nn.Module):
         return self.mahalanobis(x)    
 
 
-    
+# ==================== TDA (Test-time Dynamic Adaptation) Helper Functions ====================
+
+class TDAOnlineStats:
+    """고정 메모리로 분포 통계를 온라인으로 추적 (Welford + histogram)."""
+    def __init__(self, hist_min=0.0, hist_max=1.0, num_bins=100):
+        self.n = 0
+        self._mean = 0.0
+        self._m2 = 0.0
+        self._min = float('inf')
+        self._max = float('-inf')
+        self.hist_min = hist_min
+        self.hist_max = hist_max
+        self.num_bins = num_bins
+        self.hist_counts = [0] * num_bins
+
+    def update_single(self, x):
+        self.n += 1
+        delta = x - self._mean
+        self._mean += delta / self.n
+        delta2 = x - self._mean
+        self._m2 += delta * delta2
+        if x < self._min:
+            self._min = x
+        if x > self._max:
+            self._max = x
+        idx = int((x - self.hist_min) / (self.hist_max - self.hist_min) * self.num_bins)
+        idx = max(0, min(self.num_bins - 1, idx))
+        self.hist_counts[idx] += 1
+
+    def update_batch(self, tensor_flat):
+        """1-D tensor 또는 list를 한번에 업데이트한다."""
+        if hasattr(tensor_flat, 'tolist'):
+            vals = tensor_flat.tolist()
+        else:
+            vals = tensor_flat
+        for x in vals:
+            self.update_single(x)
+
+    def get_summary(self):
+        if self.n == 0:
+            return None
+        std = (self._m2 / self.n) ** 0.5 if self.n > 1 else 0.0
+        bin_width = (self.hist_max - self.hist_min) / self.num_bins
+        cum = 0
+        percentiles = {}
+        targets = {5: None, 10: None, 25: None, 50: None, 75: None, 90: None, 95: None}
+        for i, c in enumerate(self.hist_counts):
+            cum += c
+            frac = cum / self.n * 100
+            for p in list(targets.keys()):
+                if targets[p] is None and frac >= p:
+                    targets[p] = self.hist_min + (i + 0.5) * bin_width
+            if all(v is not None for v in targets.values()):
+                break
+        for p in targets:
+            if targets[p] is None:
+                targets[p] = self._max
+        return {
+            'n': self.n, 'mean': self._mean, 'std': std,
+            'min': self._min, 'max': self._max,
+            'percentiles': targets,
+            'hist_counts': list(self.hist_counts),
+            'hist_min': self.hist_min, 'hist_max': self.hist_max,
+        }
+@torch.no_grad()
+def tda_update_cache(cache, pred_class, feature, loss, shot_capacity, prob_map=None):
+    """TDA: 캐시에 새로운 feature를 추가하거나, 더 낮은 loss를 가진 feature로 교체"""
+    pred = int(pred_class)
+    if prob_map is not None:
+        item = [feature, loss, prob_map]
+    else:
+        item = [feature, loss]
+
+    if pred in cache:
+        if len(cache[pred]) < shot_capacity:
+            cache[pred].append(item)
+        elif loss < cache[pred][-1][1]:
+            cache[pred][-1] = item
+        cache[pred] = sorted(cache[pred], key=lambda x: x[1])
+    else:
+        cache[pred] = [item]
+
+
+@torch.no_grad()
+def tda_compute_cache_logits(features, cache, alpha, beta, num_classes,
+                             neg_mask_thresholds=None, affinity_collector=None):
+    """TDA: 캐시 기반으로 classification logit 보정값 계산"""
+    if not cache:
+        return None
+
+    cache_keys = []
+    cache_values = []
+    for class_index in sorted(cache.keys()):
+        for item in cache[class_index]:
+            cache_keys.append(item[0])
+            if neg_mask_thresholds is not None:
+                cache_values.append(item[2])
+            else:
+                cache_values.append(class_index)
+
+    cache_keys = torch.cat(cache_keys, dim=0)
+
+    if neg_mask_thresholds is not None:
+        cache_values = torch.cat(cache_values, dim=0)
+        cache_values = ((cache_values > neg_mask_thresholds[0]) &
+                        (cache_values < neg_mask_thresholds[1])).float()
+    else:
+        cache_values = F.one_hot(
+            torch.tensor(cache_values, dtype=torch.long),
+            num_classes=num_classes
+        ).float().to(features.device)
+
+    affinity = features @ cache_keys.T
+
+    if affinity_collector is not None:
+        affinity_collector.update_batch(affinity.detach().cpu().flatten())
+
+    cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
+
+    return alpha * cache_logits
+# ==================== TDA Helper Functions End ====================
+
