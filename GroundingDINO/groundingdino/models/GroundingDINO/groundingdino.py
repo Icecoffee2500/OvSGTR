@@ -61,6 +61,7 @@ from .transformer import build_transformer
 from .utils import MLP, ContrastiveEmbed 
 
 from .utils import FrequencyBias
+from .utils import tda_update_cache, tda_compute_cache_logits
 
 # 
 import bisect
@@ -605,7 +606,41 @@ class PostProcess(nn.Module):
             self.text_threshold = 1e-3
             self._positive_map = None
 
+        # ==================== TDA: Object Classification ====================
+        self.tda_obj_enabled = False
+        self.tda_obj_pos_cache = {}
+        self.tda_obj_neg_cache = {}
+        self.tda_obj_pos_alpha = 1.0
+        self.tda_obj_pos_beta = 5.0
+        self.tda_obj_pos_shot_capacity = 5
+        self.tda_obj_neg_alpha = 0.1
+        self.tda_obj_neg_beta = 1.0
+        self.tda_obj_neg_shot_capacity = 3
+        self.tda_obj_neg_entropy_lower = 0.2
+        self.tda_obj_neg_entropy_upper = 0.5
+        self.tda_obj_neg_mask_lower = 0.03
+        self.tda_obj_neg_mask_upper = 1.0
+        self.tda_obj_score_threshold = 0.3
 
+        # ==================== TDA: Relation Classification ====================
+        self.tda_rln_enabled = False
+        self.tda_rln_pos_cache = {}
+        self.tda_rln_neg_cache = {}
+        self.tda_rln_pos_alpha = 1.0
+        self.tda_rln_pos_beta = 5.0
+        self.tda_rln_pos_shot_capacity = 5
+        self.tda_rln_neg_alpha = 0.1
+        self.tda_rln_neg_beta = 1.0
+        self.tda_rln_neg_shot_capacity = 3
+        self.tda_rln_neg_entropy_lower = 0.2
+        self.tda_rln_neg_entropy_upper = 0.5
+        self.tda_rln_neg_mask_lower = 0.03
+        self.tda_rln_neg_mask_upper = 1.0
+        self.tda_rln_score_threshold = 0.3
+
+        # ==================== TDA: Stats Collection ====================
+        self.tda_collect_stats = False
+        self._init_tda_stats()
 
     def get_positive_map(self, max_text_len=2048, cat_list=None):
         if self._positive_map is not None:
@@ -635,6 +670,30 @@ class PostProcess(nn.Module):
         return self._positive_map
 
     
+    def _init_tda_stats(self):
+        from .utils import TDAOnlineStats
+        self._tda_obj_stats = {
+            'entropies': TDAOnlineStats(hist_min=0.0, hist_max=1.0),
+            'scores': TDAOnlineStats(hist_min=0.0, hist_max=1.0),
+            'affinities_pos': TDAOnlineStats(hist_min=-1.0, hist_max=1.0),
+            'affinities_neg': TDAOnlineStats(hist_min=-1.0, hist_max=1.0),
+        }
+        self._tda_rln_stats = {
+            'entropies': TDAOnlineStats(hist_min=0.0, hist_max=1.0),
+            'scores': TDAOnlineStats(hist_min=0.0, hist_max=1.0),
+            'affinities_pos': TDAOnlineStats(hist_min=-1.0, hist_max=1.0),
+            'affinities_neg': TDAOnlineStats(hist_min=-1.0, hist_max=1.0),
+        }
+
+    def get_tda_stats(self):
+        """수집된 TDA 온라인 통계를 반환하고 내부 버퍼를 초기화한다."""
+        stats = {
+            'obj': {k: v.get_summary() for k, v in self._tda_obj_stats.items()},
+            'rln': {k: v.get_summary() for k, v in self._tda_rln_stats.items()},
+        }
+        self._init_tda_stats()
+        return stats
+
     def __repr__(self):
         return f"{self.__class__.__name__}(num_select={self.num_select},\n\t  nms_iou_threshold={self.nms_iou_threshold}, \n\t score_threshold={self.score_threshold},\n\t detections_per_img={self.detections_per_img},\n\t do_sgg={self.do_sgg},  relation_thresh={self.relation_thresh}, \n\t test_overlap={self.test_overlap}, \n\t use_gt_box={self.use_gt_box}, \n\t use_text_labels={self.use_text_labels}, \n\t max_text_len={self.max_text_len})"
 
@@ -670,8 +729,73 @@ class PostProcess(nn.Module):
         batch_size = out_logits.shape[0]
         if self.use_text_labels:
             pos_maps = self.get_positive_map(self.max_text_len, cat_list).to(prob.device)
-            prob_to_label = prob @ pos_maps.T
+            prob_to_label = prob @ pos_maps.T # torch.Size([1, 900, 151])
             prob =  prob_to_label
+
+            # ==================== TDA: Object Classification Logit 보정 ====================
+            if self.tda_obj_enabled:
+                num_cat_tda = prob.shape[2]
+                _collect = self.tda_collect_stats
+
+                for bid in range(batch_size):
+                    obj_features = outputs['hs_obj'][bid]
+                    obj_prob = prob[bid]
+
+                    # TDA: L2 normalize features
+                    obj_features_norm = obj_features / (obj_features.norm(dim=-1, keepdim=True) + 1e-8)
+
+                    # TDA Step 1: 기존 캐시로 현재 이미지의 logit 보정
+                    pos_cache_logits = tda_compute_cache_logits(
+                        obj_features_norm, self.tda_obj_pos_cache,
+                        self.tda_obj_pos_alpha, self.tda_obj_pos_beta, num_cat_tda,
+                        affinity_collector=self._tda_obj_stats['affinities_pos'] if _collect else None)
+                    neg_cache_logits = tda_compute_cache_logits(
+                        obj_features_norm, self.tda_obj_neg_cache,
+                        self.tda_obj_neg_alpha, self.tda_obj_neg_beta, num_cat_tda,
+                        neg_mask_thresholds=(self.tda_obj_neg_mask_lower, self.tda_obj_neg_mask_upper),
+                        affinity_collector=self._tda_obj_stats['affinities_neg'] if _collect else None)
+
+                    if pos_cache_logits is not None:
+                        prob[bid] = prob[bid] + pos_cache_logits
+                    if neg_cache_logits is not None:
+                        prob[bid] = prob[bid] - neg_cache_logits
+
+                    # TDA Step 2: 현재 이미지의 high-confidence detection을 캐시에 추가
+                    obj_scores_max, obj_preds = obj_prob.max(dim=-1)
+
+                    for qid in range(obj_features.shape[0]):
+                        score = obj_scores_max[qid].item()
+                        pred_class = obj_preds[qid].item()
+
+                        if score < self.tda_obj_score_threshold:
+                            continue
+                        if pred_class == 0:
+                            continue
+
+                        feat = obj_features_norm[qid].unsqueeze(0)
+                        det_prob = obj_prob[qid]
+                        entropy = -(det_prob * torch.log(det_prob + 1e-8)).sum()
+                        max_entropy = math.log(num_cat_tda)
+                        prop_entropy = float(entropy / max_entropy)
+                        loss_val = float(entropy)
+
+                        if _collect:
+                            self._tda_obj_stats['entropies'].update_single(prop_entropy)
+                            self._tda_obj_stats['scores'].update_single(score)
+
+                        # TDA: Positive cache 업데이트
+                        tda_update_cache(
+                            self.tda_obj_pos_cache, pred_class,
+                            feat, loss_val, self.tda_obj_pos_shot_capacity)
+
+                        # TDA: Negative cache 업데이트 (중간 entropy 영역)
+                        if self.tda_obj_neg_entropy_lower < prop_entropy < self.tda_obj_neg_entropy_upper:
+                            prob_map = det_prob.unsqueeze(0)
+                            tda_update_cache(
+                                self.tda_obj_neg_cache, pred_class,
+                                feat, loss_val, self.tda_obj_neg_shot_capacity,
+                                prob_map=prob_map)
+            # ==================== TDA: Object Classification End ====================
 
             num_cat = prob.shape[2]
             topk_values, topk_indexes = torch.topk(prob.view(batch_size, -1), num_select, dim=1)
@@ -813,6 +937,28 @@ class PostProcess(nn.Module):
                     for batch_id, result in enumerate(results)]
                      
 
+            # ==================== TDA: Relation TDA 파라미터 전달 ====================
+            tda_rln_kwargs = {}
+            if self.tda_rln_enabled:
+                tda_rln_kwargs = {
+                    'tda_rln_enabled': True,
+                    'tda_rln_pos_cache': self.tda_rln_pos_cache,
+                    'tda_rln_neg_cache': self.tda_rln_neg_cache,
+                    'tda_rln_pos_alpha': self.tda_rln_pos_alpha,
+                    'tda_rln_pos_beta': self.tda_rln_pos_beta,
+                    'tda_rln_pos_shot_capacity': self.tda_rln_pos_shot_capacity,
+                    'tda_rln_neg_alpha': self.tda_rln_neg_alpha,
+                    'tda_rln_neg_beta': self.tda_rln_neg_beta,
+                    'tda_rln_neg_shot_capacity': self.tda_rln_neg_shot_capacity,
+                    'tda_rln_neg_entropy_lower': self.tda_rln_neg_entropy_lower,
+                    'tda_rln_neg_entropy_upper': self.tda_rln_neg_entropy_upper,
+                    'tda_rln_neg_mask_lower': self.tda_rln_neg_mask_lower,
+                    'tda_rln_neg_mask_upper': self.tda_rln_neg_mask_upper,
+                    'tda_rln_score_threshold': self.tda_rln_score_threshold,
+                    'tda_rln_stats': self._tda_rln_stats if self.tda_collect_stats else None,
+                }
+            # ==================== TDA End ====================
+
             sgg_out = graph_infer(results, self.rln_proj, self.rln_classifier, 
                                   self.rln_freq_bias,
                                   outputs['rel_text_dict'],
@@ -820,7 +966,8 @@ class PostProcess(nn.Module):
                                   self.tokenizer, 
                                   use_sigmoid=True,
                                   use_classifier=self.rln_classifier is not None,
-                                  save_features=False
+                                  save_features=False,
+                                  **tda_rln_kwargs
                                   )
 
             for batch, res in enumerate(results):

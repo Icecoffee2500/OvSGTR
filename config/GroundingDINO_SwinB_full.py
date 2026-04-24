@@ -99,8 +99,41 @@ edge_loss_coef = 1.0
 
 sgg_mode = 'full'
 
-rln_freq_bias = "data/vg150/vg_stats.pt"
+# rln_freq_bias = "data/vg150/vg_stats.pt"
+rln_freq_bias = "data/visual_genome/vg_stats.pt"
 focal_loss_for_edges = False  # set True if rln_freq_bias is None and u want to use a sigmoid focal loss for edges
 
 
 detections_per_img = 100
+
+# ==================== TDA ====================
+tda_collect_stats = False
+
+# ==================== TDA: Object Classification ====================
+tda_obj_enabled = False
+tda_obj_pos_alpha = 1.0
+tda_obj_pos_beta = 5.0
+tda_obj_pos_shot_capacity = 5
+tda_obj_neg_alpha = 0.1
+tda_obj_neg_beta = 1.0
+tda_obj_neg_shot_capacity = 3
+tda_obj_neg_entropy_lower = 0.2
+tda_obj_neg_entropy_upper = 0.5
+tda_obj_neg_mask_lower = 0.03
+tda_obj_neg_mask_upper = 1.0
+tda_obj_score_threshold = 0.3
+
+# ==================== TDA: Relation Classification ====================
+tda_rln_enabled = False
+tda_rln_pos_alpha = 1.0
+tda_rln_pos_beta = 5.0
+tda_rln_pos_shot_capacity = 5
+tda_rln_neg_alpha = 0.1
+tda_rln_neg_beta = 1.0
+tda_rln_neg_shot_capacity = 3
+tda_rln_neg_entropy_lower = 0.2
+tda_rln_neg_entropy_upper = 0.5
+tda_rln_neg_mask_lower = 0.03
+tda_rln_neg_mask_upper = 1.0
+tda_rln_score_threshold = 0.3
+# ==================== TDA End ====================
